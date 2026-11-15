@@ -1,0 +1,29 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Local credentials and configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# BGA login sessions, scraped match history, databases, and temporary exports
+data/
+*.sqlite3
+*.sqlite3-*
+*.db
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
