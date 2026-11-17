@@ -36,6 +36,47 @@ def _valid_map(value) -> str:
     return text
 
 
+def _filter_matchups(
+    games: pd.DataFrame,
+    *,
+    opponent_query: str = "",
+    opponent_rating_col: str | None = None,
+    opponent_rating_range: tuple[int, int] | None = None,
+    moves_range: tuple[int, int] | None = None,
+    results: set[int] | None = None,
+    ending: str = "全部",
+    action_filters: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    """Apply the advanced matchup-search filters used by the dashboard."""
+    result = games.copy()
+    query = opponent_query.strip()
+    if query:
+        result = result[result["opponent_name"].fillna("").str.contains(query, case=False, regex=False)]
+    if opponent_rating_col and opponent_rating_range:
+        rating = pd.to_numeric(result[opponent_rating_col], errors="coerce")
+        result = result[rating.between(*opponent_rating_range)]
+    if moves_range:
+        moves = pd.to_numeric(result["moves"], errors="coerce")
+        result = result[moves.between(*moves_range)]
+    if results is not None:
+        result = result[pd.to_numeric(result["won"], errors="coerce").isin(results)]
+    if ending == "正常完成":
+        result = result[(result["surrendered"] == 0) & (result["unfinished"] == 0)]
+    elif ending == "有认输":
+        result = result[result["surrendered"] == 1]
+    elif ending == "未完成":
+        result = result[result["unfinished"] == 1]
+    for column, state in (action_filters or {}).items():
+        values = pd.to_numeric(result[column], errors="coerce")
+        if state == "已升级":
+            result = result[values == 1]
+        elif state == "未升级":
+            result = result[values == 0]
+        elif state == "数据缺失":
+            result = result[values.isna()]
+    return result
+
+
 def _database_identity(path: Path) -> tuple[int, str] | None:
     try:
         with sqlite3.connect(path) as con:
@@ -294,8 +335,56 @@ def run(root: Path) -> None:
         af = px.line(action_df, x=x, y="升级率", color="行动卡", labels={x: x_label}, title=f"行动卡升级率（最近 {window} 局）")
         af.update_yaxes(tickformat=".0%", range=[0, 1])
         st.plotly_chart(af, use_container_width=True)
-    st.subheader("筛选后的对局")
-    games = f.sort_values("played_at", ascending=False).copy()
+    st.subheader("对局检索与直达")
+    st.caption("以下条件会叠加在左侧的日期、本人等级分和地图筛选之上。")
+    search_left, search_mid, search_right = st.columns(3)
+    with search_left:
+        opponent_query = st.text_input("对手名称包含", placeholder="留空表示不限")
+        result_labels = st.multiselect("对局结果", ["胜", "负"], default=["胜", "负"])
+        ending = st.selectbox("结束方式", ["全部", "正常完成", "有认输", "未完成"])
+    with search_mid:
+        opponent_rating_mode = st.radio("对手等级分口径", ["BGA 显示分", "原始 Elo"], horizontal=True)
+        opponent_rating_col = "opponent_bga_rating" if opponent_rating_mode == "BGA 显示分" else "opponent_elo"
+        use_opponent_rating = st.toggle("启用对手等级分筛选")
+        opponent_values = f[opponent_rating_col].dropna()
+        opponent_range = None
+        if use_opponent_rating and not opponent_values.empty:
+            opponent_lo, opponent_hi = int(opponent_values.min()), int(opponent_values.max())
+            opponent_range = st.slider(f"对手{opponent_rating_mode}", opponent_lo, opponent_hi,
+                                       (opponent_lo, opponent_hi), key="matchup_opponent_rating")
+        elif use_opponent_rating:
+            st.caption("当前数据没有对手等级分。")
+    with search_right:
+        use_moves = st.toggle("启用动数筛选")
+        move_values = f.moves.dropna()
+        moves_range = None
+        if use_moves and not move_values.empty:
+            moves_lo, moves_hi = int(move_values.min()), int(move_values.max())
+            moves_range = st.slider("动数", moves_lo, moves_hi, (moves_lo, moves_hi), key="matchup_moves")
+        elif use_moves:
+            st.caption("当前数据没有动数。")
+
+    st.markdown("**行动卡终局状态**")
+    action_filters: dict[str, str] = {}
+    for container, (column, label) in zip(st.columns(len(ACTIONS)), ACTIONS.items()):
+        with container:
+            action_filters[column] = st.selectbox(label, ["不限", "已升级", "未升级", "数据缺失"],
+                                                   key=f"matchup_{column}")
+    result_values = {"胜": 1, "负": 0}
+    games = _filter_matchups(
+        f,
+        opponent_query=opponent_query,
+        opponent_rating_col=opponent_rating_col if use_opponent_rating and opponent_range else None,
+        opponent_rating_range=opponent_range,
+        moves_range=moves_range,
+        results={result_values[label] for label in result_labels},
+        ending=ending,
+        action_filters=action_filters,
+    ).sort_values("played_at", ascending=False).copy()
+    st.caption(f"找到 {len(games):,} 局")
+    if games.empty:
+        st.info("没有符合这些检索条件的对局。")
+    games["直达"] = games.table_id.map(lambda value: f"https://boardgamearena.com/table?table={int(value)}")
     games["日期"] = games.played_at.dt.strftime("%Y-%m-%d %H:%M")
     games["结果"] = games.won.map({1: "胜", 0: "负"})
     games["比分"] = games.apply(
@@ -310,10 +399,16 @@ def run(root: Path) -> None:
     games["竞技场分"] = games.apply(
         lambda r: f"{float(r.arena_points_before):.0f} → {float(r.arena_points_after):.0f}" if pd.notna(r.arena_points_before) and pd.notna(r.arena_points_after) else "—", axis=1
     )
+    games["对手BGA分"] = games.opponent_bga_rating.map(lambda value: f"{value:.0f}" if pd.notna(value) else "—")
+    games["动数"] = games.moves.map(lambda value: f"{value:.0f}" if pd.notna(value) else "—")
+    for column, label in ACTIONS.items():
+        games[f"{label}升级"] = pd.to_numeric(games[column], errors="coerce").map({1: "是", 0: "否"}).fillna("—")
     st.dataframe(
-        games[["日期", "table_id", "opponent_name", "结果", "比分", "BGA显示分", "原始Elo", "竞技场分", "map_label", "surrendered"]].rename(
+        games[["直达", "日期", "table_id", "opponent_name", "结果", "比分", "对手BGA分", "map_label", "动数",
+               "动物升级", "建造升级", "卡牌升级", "协会升级", "赞助商升级", "BGA显示分", "竞技场分", "surrendered"]].rename(
             columns={"table_id": "桌号", "opponent_name": "对手", "map_label": "地图", "surrendered": "有认输"}
         ),
+        column_config={"直达": st.column_config.LinkColumn("直达", display_text="打开对局")},
         hide_index=True,
         use_container_width=True,
         height=420,
